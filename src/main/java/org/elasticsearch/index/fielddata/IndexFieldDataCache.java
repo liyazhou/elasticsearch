@@ -24,9 +24,11 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.RemovalListener;
 import com.google.common.cache.RemovalNotification;
 import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.SegmentReader;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.lucene.SegmentReaderUtils;
+import org.elasticsearch.index.fielddata.ordinals.GlobalOrdinalsIndexFieldData;
 import org.elasticsearch.index.mapper.FieldMapper;
 import org.elasticsearch.index.service.IndexService;
 import org.elasticsearch.index.shard.ShardId;
@@ -45,6 +47,8 @@ public interface IndexFieldDataCache {
 
     <FD extends AtomicFieldData, IFD extends IndexFieldData<FD>> FD load(AtomicReaderContext context, IFD indexFieldData) throws Exception;
 
+    <IFD extends IndexFieldData.WithOrdinals<?>> IFD load(final IndexReader indexReader, final IFD indexFieldData) throws Exception;
+
     /**
      * Clears all the field data stored cached in on this index.
      */
@@ -59,20 +63,20 @@ public interface IndexFieldDataCache {
 
     interface Listener {
 
-        void onLoad(FieldMapper.Names fieldNames, FieldDataType fieldDataType, AtomicFieldData fieldData);
+        void onLoad(FieldMapper.Names fieldNames, FieldDataType fieldDataType, RamUsage ramUsage);
 
-        void onUnload(FieldMapper.Names fieldNames, FieldDataType fieldDataType, boolean wasEvicted, long sizeInBytes, @Nullable AtomicFieldData fieldData);
+        void onUnload(FieldMapper.Names fieldNames, FieldDataType fieldDataType, boolean wasEvicted, long sizeInBytes);
     }
 
     /**
      * The resident field data cache is a *per field* cache that keeps all the values in memory.
      */
-    static abstract class FieldBased implements IndexFieldDataCache, SegmentReader.CoreClosedListener, RemovalListener<FieldBased.Key, AtomicFieldData> {
+    static abstract class FieldBased implements IndexFieldDataCache, SegmentReader.CoreClosedListener, RemovalListener<FieldBased.Key, RamUsage>, IndexReader.ReaderClosedListener {
         @Nullable
         private final IndexService indexService;
         private final FieldMapper.Names fieldNames;
         private final FieldDataType fieldDataType;
-        private final Cache<Key, AtomicFieldData> cache;
+        private final Cache<Key, RamUsage> cache;
         private final IndicesFieldDataCacheListener indicesFieldDataCacheListener;
 
         protected FieldBased(@Nullable IndexService indexService, FieldMapper.Names fieldNames, FieldDataType fieldDataType, CacheBuilder cache, IndicesFieldDataCacheListener indicesFieldDataCacheListener) {
@@ -86,17 +90,17 @@ public interface IndexFieldDataCache {
         }
 
         @Override
-        public void onRemoval(RemovalNotification<Key, AtomicFieldData> notification) {
+        public void onRemoval(RemovalNotification<Key, RamUsage> notification) {
             Key key = notification.getKey();
             assert key != null && key.listeners != null;
 
-            AtomicFieldData value = notification.getValue();
+            RamUsage value = notification.getValue();
             long sizeInBytes = key.sizeInBytes;
             if (sizeInBytes == -1 && value != null) {
                 sizeInBytes = value.getMemorySizeInBytes();
             }
             for (Listener listener : key.listeners) {
-                listener.onUnload(fieldNames, fieldDataType, notification.wasEvicted(), sizeInBytes, value);
+                listener.onUnload(fieldNames, fieldDataType, notification.wasEvicted(), sizeInBytes);
             }
         }
 
@@ -129,6 +133,36 @@ public interface IndexFieldDataCache {
             });
         }
 
+        public <IFD extends IndexFieldData.WithOrdinals<?>> IFD load(final IndexReader indexReader, final IFD indexFieldData) throws Exception {
+            final Key key = new Key(indexReader.getCoreCacheKey());
+            //noinspection unchecked
+            return (IFD) cache.get(key, new Callable<RamUsage>() {
+                @Override
+                public GlobalOrdinalsIndexFieldData call() throws Exception {
+                    indexReader.addReaderClosedListener(FieldBased.this);
+                    GlobalOrdinalsIndexFieldData ifd = (GlobalOrdinalsIndexFieldData) indexFieldData.localGlobalDirect(indexReader);
+                    key.sizeInBytes = ifd.getMemorySizeInBytes();
+                    key.listeners.add(indicesFieldDataCacheListener);
+
+                    if (indexService != null) {
+                        ShardId shardId = ShardUtils.extractShardId(indexReader);
+                        if (shardId != null) {
+                            IndexShard shard = indexService.shard(shardId.id());
+                            if (shard != null) {
+                                key.listeners.add(shard.fieldData());
+                            }
+                        }
+                    }
+
+                    for (Listener listener : key.listeners) {
+                        listener.onLoad(fieldNames, fieldDataType, ifd);
+                    }
+
+                    return ifd;
+                }
+            });
+        }
+
         @Override
         public void clear() {
             cache.invalidateAll();
@@ -147,6 +181,11 @@ public interface IndexFieldDataCache {
         @Override
         public void onClose(Object coreCacheKey) {
             cache.invalidate(new Key(coreCacheKey));
+        }
+
+        @Override
+        public void onClose(IndexReader reader) {
+            cache.invalidate(reader.getCoreCacheKey());
         }
 
         static class Key {

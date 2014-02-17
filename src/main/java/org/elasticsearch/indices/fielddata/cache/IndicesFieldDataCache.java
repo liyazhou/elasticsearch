@@ -21,6 +21,7 @@ package org.elasticsearch.indices.fielddata.cache;
 
 import com.google.common.cache.*;
 import org.apache.lucene.index.AtomicReaderContext;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.SegmentReader;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.component.AbstractComponent;
@@ -30,10 +31,8 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.index.Index;
-import org.elasticsearch.index.fielddata.AtomicFieldData;
-import org.elasticsearch.index.fielddata.FieldDataType;
-import org.elasticsearch.index.fielddata.IndexFieldData;
-import org.elasticsearch.index.fielddata.IndexFieldDataCache;
+import org.elasticsearch.index.fielddata.*;
+import org.elasticsearch.index.fielddata.ordinals.GlobalOrdinalsIndexFieldData;
 import org.elasticsearch.index.mapper.FieldMapper;
 import org.elasticsearch.index.service.IndexService;
 import org.elasticsearch.index.shard.ShardId;
@@ -47,11 +46,11 @@ import java.util.concurrent.TimeUnit;
 
 /**
  */
-public class IndicesFieldDataCache extends AbstractComponent implements RemovalListener<IndicesFieldDataCache.Key, AtomicFieldData> {
+public class IndicesFieldDataCache extends AbstractComponent implements RemovalListener<IndicesFieldDataCache.Key, RamUsage> {
 
     private final IndicesFieldDataCacheListener indicesFieldDataCacheListener;
 
-    Cache<Key, AtomicFieldData> cache;
+    Cache<Key, RamUsage> cache;
 
     private volatile String size;
     private volatile long sizeInBytes;
@@ -69,7 +68,7 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
     }
 
     private void buildCache() {
-        CacheBuilder<Key, AtomicFieldData> cacheBuilder = CacheBuilder.newBuilder()
+        CacheBuilder<Key, RamUsage> cacheBuilder = CacheBuilder.newBuilder()
                 .removalListener(this);
         if (sizeInBytes > 0) {
             cacheBuilder.maximumWeight(sizeInBytes).weigher(new FieldDataWeigher());
@@ -92,18 +91,26 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
     }
 
     @Override
-    public void onRemoval(RemovalNotification<Key, AtomicFieldData> notification) {
+    public void onRemoval(RemovalNotification<Key, RamUsage> notification) {
         Key key = notification.getKey();
         assert key != null && key.listeners != null;
 
         IndexFieldCache indexCache = key.indexCache;
         long sizeInBytes = key.sizeInBytes;
-        AtomicFieldData value = notification.getValue();
-        if (sizeInBytes == -1 && value != null) {
-            sizeInBytes = value.getMemorySizeInBytes();
+        Object genericValue = notification.getValue();
+        if (genericValue instanceof AtomicFieldData) {
+            AtomicFieldData value = (AtomicFieldData) genericValue;
+            if (sizeInBytes == -1 && value != null) {
+                sizeInBytes = value.getMemorySizeInBytes();
+            }
+        } else if (genericValue instanceof GlobalOrdinalsIndexFieldData) {
+            GlobalOrdinalsIndexFieldData value = (GlobalOrdinalsIndexFieldData) genericValue;
+            if (sizeInBytes == -1 && value != null) {
+                sizeInBytes = value.getMemorySizeInBytes();
+            }
         }
         for (IndexFieldDataCache.Listener listener : key.listeners) {
-            listener.onUnload(indexCache.fieldNames, indexCache.fieldDataType, notification.wasEvicted(), sizeInBytes, value);
+            listener.onUnload(indexCache.fieldNames, indexCache.fieldDataType, notification.wasEvicted(), sizeInBytes);
         }
     }
 
@@ -119,7 +126,7 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
     /**
      * A specific cache instance for the relevant parameters of it (index, fieldNames, fieldType).
      */
-    class IndexFieldCache implements IndexFieldDataCache, SegmentReader.CoreClosedListener {
+    class IndexFieldCache implements IndexFieldDataCache, SegmentReader.CoreClosedListener, IndexReader.ReaderClosedListener {
 
         @Nullable
         private final IndexService indexService;
@@ -162,9 +169,43 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
             });
         }
 
+        public <IFD extends IndexFieldData.WithOrdinals<?>> IFD load(final IndexReader indexReader, final IFD indexFieldData) throws Exception {
+            final Key key = new Key(this, indexReader.getCoreCacheKey());
+            //noinspection unchecked
+            return (IFD) cache.get(key, new Callable<RamUsage>() {
+                @Override
+                public RamUsage call() throws Exception {
+                    indexReader.addReaderClosedListener(IndexFieldCache.this);
+                    GlobalOrdinalsIndexFieldData ifd = (GlobalOrdinalsIndexFieldData) indexFieldData.localGlobalDirect(indexReader);
+                    key.listeners.add(indicesFieldDataCacheListener);
+
+                    if (indexService != null) {
+                        ShardId shardId = ShardUtils.extractShardId(indexReader);
+                        if (shardId != null) {
+                            IndexShard shard = indexService.shard(shardId.id());
+                            if (shard != null) {
+                                key.listeners.add(shard.fieldData());
+                            }
+                        }
+                    }
+
+                    for (Listener listener : key.listeners) {
+                        listener.onLoad(fieldNames, fieldDataType, ifd);
+                    }
+
+                    return ifd;
+                }
+            });
+        }
+
         @Override
         public void onClose(Object coreKey) {
             cache.invalidate(new Key(this, coreKey));
+        }
+
+        @Override
+        public void onClose(IndexReader reader) {
+            cache.invalidate(new Key(this, reader.getCoreCacheKey()));
         }
 
         @Override
