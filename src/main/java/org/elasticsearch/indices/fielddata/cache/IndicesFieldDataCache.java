@@ -97,17 +97,9 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
 
         IndexFieldCache indexCache = key.indexCache;
         long sizeInBytes = key.sizeInBytes;
-        Object genericValue = notification.getValue();
-        if (genericValue instanceof AtomicFieldData) {
-            AtomicFieldData value = (AtomicFieldData) genericValue;
-            if (sizeInBytes == -1 && value != null) {
-                sizeInBytes = value.getMemorySizeInBytes();
-            }
-        } else if (genericValue instanceof GlobalOrdinalsIndexFieldData) {
-            GlobalOrdinalsIndexFieldData value = (GlobalOrdinalsIndexFieldData) genericValue;
-            if (sizeInBytes == -1 && value != null) {
-                sizeInBytes = value.getMemorySizeInBytes();
-            }
+        RamUsage value = notification.getValue();
+        if (sizeInBytes == -1 && value != null) {
+            sizeInBytes = value.getMemorySizeInBytes();
         }
         for (IndexFieldDataCache.Listener listener : key.listeners) {
             listener.onUnload(indexCache.fieldNames, indexCache.fieldDataType, notification.wasEvicted(), sizeInBytes);
@@ -188,11 +180,9 @@ public class IndicesFieldDataCache extends AbstractComponent implements RemovalL
                             }
                         }
                     }
-
                     for (Listener listener : key.listeners) {
                         listener.onLoad(fieldNames, fieldDataType, ifd);
                     }
-
                     return ifd;
                 }
             });
