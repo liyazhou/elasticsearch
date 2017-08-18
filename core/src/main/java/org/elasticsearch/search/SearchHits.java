@@ -23,7 +23,8 @@ import org.elasticsearch.Version;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Streamable;
-import org.elasticsearch.common.xcontent.ToXContent;
+import org.elasticsearch.common.xcontent.ToXContent.Params;
+import org.elasticsearch.common.xcontent.ToXContentFragment;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentParser;
 
@@ -36,7 +37,7 @@ import java.util.Objects;
 
 import static org.elasticsearch.common.xcontent.XContentParserUtils.ensureExpectedToken;
 
-public final class SearchHits implements Streamable, ToXContent, Iterable<SearchHit> {
+public final class SearchHits implements Streamable, ToXContentFragment, Iterable<SearchHit> {
 
     public static SearchHits empty() {
         // We shouldn't use static final instance, since that could directly be returned by native transport clients
@@ -59,12 +60,6 @@ public final class SearchHits implements Streamable, ToXContent, Iterable<Search
         this.hits = hits;
         this.totalHits = totalHits;
         this.maxScore = maxScore;
-    }
-
-    public void shardTarget(SearchShardTarget shardTarget) {
-        for (SearchHit hit : hits) {
-            hit.shard(shardTarget);
-        }
     }
 
     /**
@@ -99,10 +94,6 @@ public final class SearchHits implements Streamable, ToXContent, Iterable<Search
     @Override
     public Iterator<SearchHit> iterator() {
         return Arrays.stream(getHits()).iterator();
-    }
-
-    public SearchHit[] internalHits() {
-        return this.hits;
     }
 
     public static final class Fields {
